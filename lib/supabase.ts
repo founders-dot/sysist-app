@@ -1,23 +1,38 @@
-import { createBrowserClient } from '@supabase/ssr';
 import { createClient } from '@supabase/supabase-js';
-import type { SupabaseClient } from '@supabase/supabase-js';
 
-// Client-side Supabase client for use in React components
-// Uses the public anon key and is safe to use in the browser
-export const supabaseClient: SupabaseClient = createBrowserClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-);
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 
-// Server-side Supabase admin client for use in API routes and server components
-// Uses the service role key with elevated permissions - NEVER expose to client
-export const supabaseAdmin: SupabaseClient = createClient(
-  process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.SUPABASE_SERVICE_KEY!,
-  {
+// Client for browser-side operations
+export const supabase = createClient(supabaseUrl, supabaseAnonKey);
+
+// Server-side client with service role key (for API routes)
+export const getServerSupabase = () => {
+  const supabaseServiceKey = process.env.SUPABASE_SERVICE_KEY!;
+  return createClient(supabaseUrl, supabaseServiceKey, {
     auth: {
       autoRefreshToken: false,
-      persistSession: false,
-    },
-  }
-);
+      persistSession: false
+    }
+  });
+};
+
+// Helper function to subscribe to real-time messages
+export const subscribeToMessages = (
+  chatId: string,
+  callback: (payload: any) => void
+) => {
+  return supabase
+    .channel(`messages:${chatId}`)
+    .on(
+      'postgres_changes',
+      {
+        event: 'INSERT',
+        schema: 'public',
+        table: 'messages',
+        filter: `chat_id=eq.${chatId}`
+      },
+      callback
+    )
+    .subscribe();
+};

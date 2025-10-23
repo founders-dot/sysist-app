@@ -1,188 +1,151 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { supabaseAdmin } from '@/lib/supabase';
+import { getServerSupabase } from '@/lib/supabase';
+import { BookingCallbackRequest } from '@/types';
+import crypto from 'crypto';
 
-// Webhook request body type definition
-interface BookingCallbackRequest {
-  callId: string;
-  status: string;
-  result?: {
-    reason?: string;
-    [key: string]: any;
-  };
-  transcript?: string;
-  duration?: number;
-}
+export const runtime = 'edge';
 
-// Booking database record type
-interface Booking {
-  id: string;
-  chat_id: string;
-  user_id: string;
-  booking_type: string;
-  call_id: string;
-  status: string;
-  details: {
-    restaurantName: string;
-    phoneNumber: string;
-    dateTime: string;
-    partySize: number;
-    customerName: string;
-    specialRequests?: string;
-  };
-}
-
-/**
- * Creates a status-specific system message for the user
- */
-function createSystemMessage(status: string, booking: Booking, result?: any): string {
-  const { restaurantName, phoneNumber, dateTime, partySize, customerName } = booking.details;
-
-  switch (status) {
-    case 'completed':
-    case 'ended':
-      return `✅ Great news! Your reservation at ${restaurantName} is CONFIRMED for ${dateTime}, party of ${partySize} people under the name ${customerName}.`;
-
-    case 'failed':
-      const reason = result?.reason || 'Unknown error';
-      return `❌ Sorry, we couldn't complete your booking. ${reason}. Would you like me to try again or call them directly at ${phoneNumber}?`;
-
-    case 'busy':
-      return `📵 The line was busy. Would you like me to retry in a few minutes?`;
-
-    case 'no-answer':
-      return `📵 No one answered. The restaurant might be closed or very busy right now.`;
-
-    case 'voicemail':
-      return `📧 The call went to voicemail. You may want to call them directly at ${phoneNumber}.`;
-
-    default:
-      return `ℹ️ Call status: ${status}. Please check with the restaurant at ${phoneNumber} to confirm your reservation.`;
-  }
-}
-
-/**
- * POST /api/booking/callback
- * Webhook endpoint called by MCP server when calls complete
- */
 export async function POST(request: NextRequest) {
-  const timestamp = new Date().toISOString();
-
   try {
-    // Validate webhook secret
-    const webhookSecret = request.headers.get('x-webhook-secret');
-    const expectedSecret = process.env.WEBHOOK_SECRET;
+    // Verify webhook signature for security
+    const signature = request.headers.get('x-webhook-signature');
+    const webhookSecret = process.env.WEBHOOK_SECRET;
 
-    if (!expectedSecret) {
-      console.error('[Booking Callback] WEBHOOK_SECRET not configured');
-      return NextResponse.json(
-        { error: 'Server configuration error' },
-        { status: 500 }
-      );
+    if (webhookSecret && signature) {
+      const body = await request.text();
+      const expectedSignature = crypto
+        .createHmac('sha256', webhookSecret)
+        .update(body)
+        .digest('hex');
+
+      if (signature !== expectedSignature) {
+        console.error('Invalid webhook signature');
+        return NextResponse.json(
+          { success: false, error: 'Invalid signature' },
+          { status: 401 }
+        );
+      }
+
+      // Parse the body after verification
+      var callbackData: BookingCallbackRequest = JSON.parse(body);
+    } else {
+      // If no signature verification is needed, parse directly
+      callbackData = await request.json();
     }
 
-    if (webhookSecret !== expectedSecret) {
-      console.error('[Booking Callback] Unauthorized webhook attempt at', timestamp);
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
-    }
+    const { callId, status, result, transcript, duration, reason } = callbackData;
 
-    // Parse request body
-    const body: BookingCallbackRequest = await request.json();
-    console.log('[Booking Callback] Received webhook:', {
-      timestamp,
-      callId: body.callId,
-      status: body.status,
-      duration: body.duration,
-    });
-
-    // Validate required fields
-    if (!body.callId || !body.status) {
-      console.error('[Booking Callback] Missing required fields:', body);
+    if (!callId) {
       return NextResponse.json(
-        { error: 'Missing required fields: callId and status' },
+        { success: false, error: 'Missing callId' },
         { status: 400 }
       );
     }
 
-    // Find booking by call_id
-    console.log('[Booking Callback] Looking up booking with call_id:', body.callId);
-    const { data: booking, error: findError } = await supabaseAdmin
+    const supabase = getServerSupabase();
+
+    // Find booking by callId
+    const { data: booking, error: findError } = await supabase
       .from('bookings')
-      .select('*')
-      .eq('call_id', body.callId)
+      .select('*, chats(user_id)')
+      .eq('call_id', callId)
       .single();
 
     if (findError || !booking) {
-      console.error('[Booking Callback] Booking not found for call_id:', body.callId, findError);
+      console.error('Booking not found for callId:', callId, findError);
       return NextResponse.json(
-        { error: 'Booking not found' },
+        { success: false, error: 'Booking not found' },
         { status: 404 }
       );
     }
 
-    console.log('[Booking Callback] Found booking:', booking.id);
-
-    // Update booking record
-    const updateData = {
-      status: body.status,
-      result: {
-        transcript: body.transcript || '',
-        duration: body.duration || 0,
-        ...body.result,
-      },
-      updated_at: new Date().toISOString(),
-    };
-
-    console.log('[Booking Callback] Updating booking with status:', body.status);
-    const { error: updateError } = await supabaseAdmin
+    // Update booking status and result
+    const bookingStatus = status === 'completed' ? 'completed' : 'failed';
+    const { error: updateError } = await supabase
       .from('bookings')
-      .update(updateData)
+      .update({
+        status: bookingStatus,
+        result: {
+          transcript,
+          duration,
+          reason,
+          ...result,
+        },
+      })
       .eq('id', booking.id);
 
     if (updateError) {
-      console.error('[Booking Callback] Failed to update booking:', updateError);
-      return NextResponse.json(
-        { error: 'Failed to update booking', details: updateError.message },
-        { status: 500 }
-      );
+      console.error('Error updating booking:', updateError);
+      throw updateError;
     }
 
-    // Create system message based on status
-    const systemMessage = createSystemMessage(body.status, booking as Booking, body.result);
-    console.log('[Booking Callback] Created system message:', systemMessage.substring(0, 100) + '...');
+    // Create appropriate message based on status
+    let messageContent = '';
+    const businessName = booking.details.restaurantName || booking.details.businessName || 'the business';
 
-    // Insert message into messages table
-    const { error: messageError } = await supabaseAdmin
+    switch (status) {
+      case 'completed':
+        messageContent = `✅ Great news! Your reservation at ${businessName} is CONFIRMED for ${booking.details.dateTime}, party of ${booking.details.partySize}.`;
+        if (transcript) {
+          messageContent += `\n\nCall Summary:\n${transcript}`;
+        }
+        break;
+
+      case 'failed':
+        messageContent = `❌ We couldn't complete your booking at ${businessName}.`;
+        if (reason) {
+          messageContent += ` Reason: ${reason}.`;
+        }
+        messageContent += ' Would you like me to try again or try a different time?';
+        break;
+
+      case 'busy':
+        messageContent = `📵 The line was busy when we tried to call ${businessName}. Would you like me to retry?`;
+        break;
+
+      case 'no-answer':
+        messageContent = `📵 There was no answer when we called ${businessName}. They might be closed or very busy. Would you like to try again later?`;
+        break;
+
+      default:
+        messageContent = `ℹ️ The call to ${businessName} ended with status: ${status}.`;
+    }
+
+    // Insert system message
+    const { error: messageError } = await supabase
       .from('messages')
       .insert({
         chat_id: booking.chat_id,
         role: 'system',
-        content: systemMessage,
+        content: messageContent,
         metadata: {
-          callId: body.callId,
+          callId,
           bookingId: booking.id,
-          status: body.status,
+          status,
         },
       });
 
     if (messageError) {
-      console.error('[Booking Callback] Failed to insert message:', messageError);
-      // Don't fail the webhook - booking was already updated
-      // Just log the error
+      console.error('Error inserting message:', messageError);
+      throw messageError;
     }
 
-    console.log('[Booking Callback] Webhook processed successfully for callId:', body.callId);
+    // Log callback for debugging
+    console.log('Booking callback processed:', {
+      callId,
+      bookingId: booking.id,
+      status,
+      timestamp: new Date().toISOString(),
+    });
 
     return NextResponse.json({ success: true });
-  } catch (error) {
-    console.error('[Booking Callback] Unexpected error at', timestamp, ':', error);
 
+  } catch (error) {
+    console.error('Error in booking callback API:', error);
     return NextResponse.json(
       {
-        error: 'Internal server error',
-        details: error instanceof Error ? error.message : String(error),
+        success: false,
+        error: error instanceof Error ? error.message : 'Internal server error',
       },
       { status: 500 }
     );
